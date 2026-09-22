@@ -107,6 +107,10 @@ rm -rf ~/.local/state/wslc-remote
 
 `unfsd` was installed separately — remove it with your package manager if you don't want it.
 
+## Support
+
+Although I do work on the WSL team, this is being submitted as a community project from me personally (Craig Loewen) not as a representative of the WSL team. So this project will have community level support. Please treat it as you would any other open source community project. 
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
