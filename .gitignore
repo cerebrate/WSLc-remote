@@ -1,0 +1,15 @@
+# Runtime state (shares, logs, NFS exports)
+*.env
+*.exports
+*.log
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Build / scratch
+/tmp/
+/build/

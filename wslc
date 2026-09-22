@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+#
+# wslc-remote — VS Code Remote-WSL-style fast file sharing for `wslc` containers.
+#
+# It is a transparent, NFS-accelerated **drop-in for `wslc`**: run it exactly as
+# you would run `wslc`. Commands are dispatched as follows:
+#
+#   run, create   Same args as `wslc run`/`wslc create`, but any *bind mount*
+#                 whose source is a host directory (`-v /host/dir:/ctr[:opts]`,
+#                 `--volume ...`, `--mount type=bind,source=/host/dir,...`) is
+#                 transparently served over NFS instead of the default virtiofs
+#                 share, then the real `wslc` command is exec'd. Multiple binds
+#                 are handled; named volumes / tmpfs / non-dir sources pass
+#                 through untouched.
+#   volume        `remove`/`prune` also tear down (and reconcile) the matching
+#                 wslc-remote NFS share; every other volume subcommand passes
+#                 straight through to `wslc volume`.
+#   anything else Forwarded unchanged to `wslc` (inspect, images, logs, exec,
+#                 list, system, build, pull, ...). Plus two wslc-remote-only
+#                 verbs, `_`-prefixed so they can never collide with a wslc
+#                 subcommand: `_check` (verify dependencies) and `_help`.
+#
+# Why: wslc runs containers in a *separate* VM, so a `-v` host bind crosses that
+# boundary over virtiofs. wslc's own named volumes use the `guest` driver, which
+# is that same virtiofs share. For trees with many small files (git, node_modules,
+# builds) NFS is ~13x faster for builds and far more for metadata (see README /
+# results/).
+#
+# Data path:  container ── wslc guest volume ── NFS mount on the volume's backing
+#             store (runtime VM, 127.0.0.1) ── mirrored localhost ── unfsd (UNFS3)
+#             userspace NFS server (this distro) ── ext4 files.
+#
+set -euo pipefail
+
+# wslc-remote serves each host bind over NFS using a single userspace NFSv3
+# server: UNFS3's `unfsd` (https://github.com/unfs3/unfs3). That binary is the
+# only extra dependency — nothing ships in this repo. Install it from that repo
+# and put it on PATH (or point WSLC_REMOTE_UNFSD=/path at an existing binary).
+#
+# unfsd is launched with -s (single-user: all I/O as the invoking user, so a
+# container's volume-init chown/chmod SETATTR succeeds), -p (never register with
+# rpcbind/portmap — that wedges under mirrored WSL2), -t (TCP only) and the same
+# port for NFS and MOUNT. See start_nfsd() below.
+UNFSD_BIN="${WSLC_REMOTE_UNFSD:-unfsd}"
+STATE_DIR="${WSLC_REMOTE_STATE:-$HOME/.local/state/wslc-remote}"
+SHARES_DIR="$STATE_DIR/shares"
+BASE_PORT="${WSLC_REMOTE_BASE_PORT:-12049}"
+LOOPBACK="127.0.0.1"
+
+# Resolve the Windows wslc CLI (PATH first, then the default install location).
+# Note wslc-remote installs itself as `wslc`, so we deliberately look for
+# `wslc.exe` only — never a bare `wslc`, which would resolve back to this script.
+WSLC="${WSLC:-}"
+if [[ -z "$WSLC" ]]; then
+  if command -v wslc.exe >/dev/null 2>&1; then WSLC="wslc.exe"
+  else WSLC="/mnt/c/Program Files/WSL/wslc.exe"; fi
+else
+  # $WSLC was set explicitly. Since this script is itself installed as `wslc`,
+  # a value like WSLC=wslc would make every passthrough re-exec us forever.
+  _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  _target="$(command -v "$WSLC" 2>/dev/null || true)"
+  [[ -n "$_target" ]] && _target="$(readlink -f "$_target" 2>/dev/null || echo "$_target")"
+  if [[ -n "$_self" && "$_self" == "$_target" ]]; then
+    printf '\033[31m[wslc-remote] error:\033[0m %s\n' \
+      "\$WSLC points back at wslc-remote itself ($_self). Set WSLC to the real wslc.exe, e.g. /mnt/c/Program Files/WSL/wslc.exe" >&2
+    exit 1
+  fi
+  unset _self _target
+fi
+
+# NFS options for the runtime VM's `mount(2)`. `mount -i` bypasses /sbin/mount.nfs
+# (which hangs on a portmapper probe over mirrored loopback) and issues the
+# syscall directly.
+nfs_opts() { echo "vers=3,addr=$LOOPBACK,port=$1,mountport=$1,mountvers=3,mountproto=tcp,proto=tcp,nolock,soft,timeo=600,retrans=3"; }
+
+log()  { printf '\033[36m[wslc-remote]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m[wslc-remote] warning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m[wslc-remote] error:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Internal management calls into the runtime session. Detach stdin from the
+# terminal: `wslc system session run` keeps the session channel open until it
+# sees stdin EOF, so with an interactive TTY it would hang *after* the remote
+# command (e.g. `mount`) has already finished. The interactive container run
+# uses a separate `exec "$WSLC" ...` path that intentionally keeps the TTY.
+session_run() { "$WSLC" system session run "$@" </dev/null; }
+
+# vol_name_for <hostdir> [ro] : stable per-share volume name. The read-only flag
+# is folded into the hash so a read-only and a read-write share of the same host
+# directory get distinct volumes/servers (distinct export modes) and never reuse
+# each other's state. rw names are unchanged from before (no suffix).
+vol_name_for() {
+  local key="$1"
+  [[ "${2:-}" == ro ]] && key="$1"$'\037'"ro"
+  printf 'wslcr_%s' "$(printf '%s' "$key" | sha1sum | cut -c1-12)"
+}
+ensure_state() { mkdir -p "$SHARES_DIR"; }
+
+# ---------------------------------------------------------------------------
+# Server management (single backend: userspace unfsd).
+#
+# ensure_server : verify the userspace NFS server is available before sharing.
+ensure_server() {
+  if ! command -v "$UNFSD_BIN" >/dev/null 2>&1; then
+    die "userspace NFS server '$UNFSD_BIN' not found on PATH.
+  Install UNFS3's unfsd (https://github.com/unfs3/unfs3) and put it on PATH,
+  or point WSLC_REMOTE_UNFSD at an existing unfsd binary."
+  fi
+  log "NFS server: $(command -v "$UNFSD_BIN")"
+}
+
+# start_nfsd <vol> <hostdir> <port> [ro] : launch unfsd serving <hostdir> on
+# $LOOPBACK:<port>. Sets NFSD_PID to the server's pid. The export is pinned to
+# the loopback client ($LOOPBACK) — the only address the runtime VM reaches this
+# distro on — rather than unfs3's default "any client", and is exported
+# read-only when the bind was requested read-only (`-v ...:ro` /
+# `--mount ...,readonly`) so a `:ro` source can't be written through the
+# unauthenticated NFS export. `rw` binds keep `no_root_squash` (dockerd's
+# volume-init chown/chmod, applied as the invoking user via -s, must succeed).
+# `insecure` permits the runtime VM's unprivileged source port under mirrored
+# networking.
+start_nfsd() {
+  local vol="$1" dir="$2" port="$3" ro="${4:-}"
+  local ef="$STATE_DIR/$vol.exports" opts
+  if [[ "$ro" == ro ]]; then opts="ro,insecure"; else opts="rw,no_root_squash,insecure"; fi
+  printf '%s %s(%s)\n' "$dir" "$LOOPBACK" "$opts" >"$ef"
+  nohup "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$port" -m "$port" -e "$ef" \
+      >"$STATE_DIR/$vol.log" 2>&1 &
+  NFSD_PID=$!
+}
+
+alloc_port() {
+  local used port
+  used="$(cat "$SHARES_DIR"/*.env 2>/dev/null | sed -n 's/^PORT=//p' | tr '\n' ' ')"
+  for (( port=BASE_PORT; port<BASE_PORT+128; port++ )); do
+    [[ " $used " == *" $port "* ]] && continue   # reserved by one of our shares
+    port_is_up "$port" && continue               # in use by some other process (e.g. a stale server)
+    echo "$port"; return 0
+  done
+  die "no free port in range $BASE_PORT-$((BASE_PORT+127))"
+}
+
+port_is_up()  { timeout 3 bash -c "exec 3<>/dev/tcp/$LOOPBACK/$1" 2>/dev/null; }
+vol_mounted() { session_run sh -c "grep -q ' /var/lib/docker/volumes/$1/_data nfs ' /proc/mounts" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# abort_share <vol> <pid> : roll back a partially-created share so that a failure
+# leaves nothing running, mounted, or half-registered — no orphaned unfsd, NFS
+# mount, guest volume, or state file. Safe to call at any failure point; every
+# step is best-effort.
+abort_share() {
+  local vol="$1" pid="${2:-}"
+  warn "cleaning up partial share '$vol'"
+  session_run sh -c "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null \
+    || umount -l /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" >/dev/null 2>&1 || true
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  "$WSLC" volume remove "$vol" >/dev/null 2>&1 </dev/null \
+    || session_run docker volume rm "$vol" >/dev/null 2>&1 || true
+  rm -f "$SHARES_DIR/$vol.env" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
+}
+
+# ---------------------------------------------------------------------------
+# share <hostdir> [ro] [name] -> sets SHARE_VOL to the wslc guest volume name.
+# `ro` (the string "ro" or empty) selects a read-only NFS export. Internal:
+# invoked while rewriting host binds during `run`/`create`. Runs in the
+# caller's (main) shell — NOT inside a command substitution — so that a die() in
+# the sharing path (missing unfsd, no free port, mount failure, ...) aborts
+# wslc-remote entirely instead of being swallowed by a subshell and silently
+# falling back to an un-accelerated plain `wslc` command.
+share() {
+  [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
+  ensure_state; ensure_server
+  local dir ro vol port statef
+  dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
+  ro="${2:-}"
+  vol="${3:-$(vol_name_for "$dir" "$ro")}"
+  statef="$SHARES_DIR/$vol.env"
+
+  # Idempotent: reuse a healthy existing share.
+  if [[ -f "$statef" ]]; then
+    # shellcheck disable=SC1090
+    source "$statef"
+    if kill -0 "${PID:-0}" 2>/dev/null && port_is_up "$PORT" && vol_mounted "$vol"; then
+      log "reusing share: $dir -> volume '$vol' (port $PORT)"
+      SHARE_VOL="$vol"; return 0
+    fi
+    stop_share "$vol" >/dev/null 2>&1 || true
+  fi
+
+  port="$(alloc_port)"
+  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
+  start_nfsd "$vol" "$dir" "$port" "$ro"
+  local pid=$NFSD_PID
+
+  # Wait for OUR server to accept connections. Bail out the moment it dies (e.g.
+  # it couldn't bind the port): otherwise a *different* server already listening
+  # on $port would satisfy port_is_up and we'd mount against the wrong export.
+  local i
+  for (( i=0; i<50; i++ )); do
+    kill -0 "$pid" 2>/dev/null || break
+    port_is_up "$port" && break
+    sleep 0.1
+  done
+  if ! kill -0 "$pid" 2>/dev/null; then
+    abort_share "$vol" "$pid"
+    die "NFS server (unfsd) exited at startup — port $port may be held by a stale server. See $STATE_DIR/$vol.log"
+  fi
+  if ! port_is_up "$port"; then
+    abort_share "$vol" "$pid"
+    die "NFS server did not come up on $LOOPBACK:$port (see $STATE_DIR/$vol.log)"
+  fi
+
+  log "creating wslc guest volume '$vol' and NFS-mounting its backing store"
+  "$WSLC" volume create --driver guest "$vol" >/dev/null 2>&1 </dev/null || true
+  if ! session_run sh -c "
+    T=/var/lib/docker/volumes/$vol/_data
+    mkdir -p \"\$T\"
+    grep -q \" \$T nfs \" /proc/mounts || mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
+  "; then
+    abort_share "$vol" "$pid"
+    die "failed to NFS-mount volume backing store (see $STATE_DIR/$vol.log)"
+  fi
+
+  cat > "$statef" <<EOF
+DIR=$dir
+VOLUME=$vol
+PORT=$port
+PID=$pid
+RO=$ro
+EOF
+  log "share ready: $dir -> volume '$vol'"
+  SHARE_VOL="$vol"
+}
+
+# ---------------------------------------------------------------------------
+stop_share() {
+  local vol="$1" statef="$SHARES_DIR/$1.env"
+  [[ -f "$statef" ]] || { warn "no such share: $vol"; return 1; }
+  # shellcheck disable=SC1090
+  source "$statef"
+  # Guest volumes are docker local volumes in the runtime dockerd; remove any
+  # container still holding it (else volume removal fails), then unmount + remove.
+  local cids
+  cids="$(session_run docker ps -aq --filter "volume=$vol" 2>/dev/null | tr -d '\r')"
+  if [[ -n "$cids" ]]; then
+    log "removing containers using '$vol'"
+    # shellcheck disable=SC2086
+    session_run docker rm -f $cids >/dev/null 2>&1 || true
+  fi
+  log "unmounting + removing volume '$vol'"
+  session_run sh -c "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" || true
+  "$WSLC" volume remove "$vol" >/dev/null 2>&1 </dev/null \
+    || session_run docker volume rm "$vol" >/dev/null 2>&1 \
+    || warn "could not remove volume '$vol' (a container may still use it)"
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
+    log "stopping NFS server (pid $PID)"; kill "$PID" 2>/dev/null || true
+  fi
+  rm -f "$statef" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
+}
+
+# ---------------------------------------------------------------------------
+# Bind-mount detection + rewriting.
+
+# Does this `-v` source refer to a host path (vs a named volume)?
+is_host_path() {
+  case "$1" in
+    /*|./*|../*|~/*|~|.|..) return 0 ;;
+    *) [[ "$1" == */* ]] && return 0 || return 1 ;;
+  esac
+}
+
+# Given a bind source that is a host directory, NFS-ify it and set NFSIFY_VOL to
+# the guest volume name (return 0). `ro` ("ro" or empty) is propagated so a
+# read-only bind is exported read-only. On any non-host-dir / non-existent
+# source, set nothing and return 1 so the caller keeps the original source.
+nfsify_dir() {
+  local src="$1" ro="${2:-}" abs
+  is_host_path "$src" || return 1
+  abs="$(cd "$src" 2>/dev/null && pwd)" || { warn "bind source is not an existing directory, passing through: $src"; return 1; }
+  share "$abs" "$ro"
+  NFSIFY_VOL="$SHARE_VOL"
+}
+
+# Rewrite a `-v`/`--volume` spec "SRC:DST[:opts]" into REWRITE_SPEC (the possibly
+# rewritten spec). Sources that are host directories become the NFS volume name.
+# A `ro` option makes the NFS export read-only too. Called directly (not in a
+# subshell) so a die() in sharing aborts the program.
+rewrite_v_spec() {
+  local spec="$1" src rest opts ro=""
+  [[ "$spec" == *:* ]] || { REWRITE_SPEC="$spec"; return; }   # anonymous volume, leave as-is
+  src="${spec%%:*}"; rest="${spec#*:}"
+  [[ "$rest" == *:* ]] && opts="${rest#*:}" || opts=""         # opts follow the DST (second colon)
+  case ",$opts," in *,ro,*) ro="ro" ;; esac
+  if nfsify_dir "$src" "$ro"; then REWRITE_SPEC="$NFSIFY_VOL:$rest"; else REWRITE_SPEC="$spec"; fi
+}
+
+# Convert a `--mount` spec into an equivalent `-v` spec, stored in MOUNT_SPEC
+# (wslc has no --mount flag). Bind sources that are host directories are
+# NFS-ified; volume sources pass through as named volumes. Called directly (not
+# in a subshell) so a die() in sharing aborts the program.
+mount_to_v() {
+  local spec="$1" field key val src="" dst="" ro="" type=""
+  local -a fields=()
+  while IFS= read -r field; do fields+=("$field"); done < <(printf '%s\n' "$spec" | tr ',' '\n')
+  for field in "${fields[@]}"; do
+    key="${field%%=*}"; val="${field#*=}"
+    case "$key" in
+      type)                    type="$val" ;;
+      source|src)              src="$val" ;;
+      destination|dst|target)  dst="$val" ;;
+      readonly|ro)             [[ "$val" != false ]] && ro="ro" ;;
+    esac
+  done
+  [[ -n "$dst" ]] || die "--mount missing destination/target: $spec"
+  if [[ "$type" == bind || -z "$type" ]] && nfsify_dir "$src" "$ro"; then src="$NFSIFY_VOL"; fi
+  if [[ -n "$ro" ]]; then MOUNT_SPEC="$src:$dst:ro"; else MOUNT_SPEC="$src:$dst"; fi
+}
+
+# run_wslc <run|create> <args...> : transparently NFS-ify host binds, then run wslc.
+run_wslc() {
+  local sub="$1"; shift
+  [[ $# -ge 1 ]] || die "usage: wslc $sub <wslc $sub args...>"
+  ensure_state
+  local out=() a
+  while [[ $# -gt 0 ]]; do
+    a="$1"
+    case "$a" in
+      -v|--volume)        shift; [[ $# -gt 0 ]] || die "$a requires an argument"
+                          rewrite_v_spec "$1"; out+=(-v "$REWRITE_SPEC") ;;
+      -v=*|--volume=*)    rewrite_v_spec "${a#*=}"; out+=(-v "$REWRITE_SPEC") ;;
+      --mount)            shift; [[ $# -gt 0 ]] || die "--mount requires an argument"
+                          mount_to_v "$1"; out+=(-v "$MOUNT_SPEC") ;;
+      --mount=*)          mount_to_v "${a#*=}"; out+=(-v "$MOUNT_SPEC") ;;
+      *)                  out+=("$a") ;;
+    esac
+    shift
+  done
+  log "wslc $sub ${out[*]}"
+  exec "$WSLC" "$sub" "${out[@]}"
+}
+
+# handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
+# is aware of wslc-remote's NFS-backed shares. `remove`/`rm` of a tracked share
+# tears the whole share down (server + mount + state), and `prune` reconciles any
+# shares whose backing volume it removed. Everything else passes straight through.
+handle_volume() {
+  local sub="${1:-}"
+  case "$sub" in
+    rm|remove)
+      shift; ensure_state
+      local rc=0 v names=0
+      local -a passthrough=()
+      for v in "$@"; do
+        if [[ "$v" == -* ]]; then passthrough+=("$v"); continue; fi
+        if [[ -f "$SHARES_DIR/$v.env" ]]; then
+          log "'$v' is a wslc-remote share; tearing it down"
+          stop_share "$v" || rc=1
+        else
+          passthrough+=("$v"); names=$((names+1))
+        fi
+      done
+      [[ $names -gt 0 ]] && { "$WSLC" volume remove "${passthrough[@]}" || rc=1; }
+      exit $rc ;;
+    prune)
+      shift; ensure_state
+      "$WSLC" volume prune "$@" || true
+      reconcile_shares
+      exit 0 ;;
+    *) exec "$WSLC" volume "$@" ;;
+  esac
+}
+
+# Drop any share whose backing wslc volume no longer exists (e.g. removed by a
+# bare `wslc volume remove`/`prune`): stop its server and delete its state.
+reconcile_shares() {
+  ensure_state
+  local f vol
+  for f in "$SHARES_DIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    vol="$(basename "$f" .env)"
+    if ! vol_mounted "$vol"; then
+      log "share '$vol' backing volume gone; stopping server + cleaning state"
+      # shellcheck disable=SC1090
+      ( source "$f"; [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true )
+      rm -f "$f" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# check_deps : verify the one extra dependency (unfsd) plus the wslc pieces
+# wslc-remote relies on, ending with a real loopback reachability probe between
+# the runtime VM and this distro (mirrored networking). No installs.
+check_deps() {
+  local ok=1
+  _pass(){ printf '  \033[32mOK  \033[0m %s\n' "$1"; }
+  _fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$1"; ok=0; }
+
+  echo "wslc-remote — dependency check"
+
+  if command -v "$UNFSD_BIN" >/dev/null 2>&1; then
+    _pass "userspace NFS server: $(command -v "$UNFSD_BIN")"
+  else
+    _fail "unfsd (UNFS3) not on PATH — install from https://github.com/unfs3/unfs3 or set WSLC_REMOTE_UNFSD"
+  fi
+
+  if "$WSLC" version >/dev/null 2>&1; then _pass "wslc CLI: $WSLC"; else _fail "wslc CLI not found (set \$WSLC or install WSL container support)"; fi
+
+  if session_run true >/dev/null 2>&1; then _pass "wslc runtime session works"; else _fail "cannot run in the wslc runtime session"; fi
+
+  if session_run sh -c 'modprobe nfs 2>/dev/null; grep -qw nfs /proc/filesystems'; then _pass "runtime VM has an NFS client"; else _fail "runtime VM has no nfs client"; fi
+
+  # The whole data path depends on the runtime VM reaching this distro over
+  # 127.0.0.1, which only works with WSL mirrored networking. Without it every
+  # share fails at mount time with a confusing "Connection refused", so test it
+  # for real: serve a scratch directory and try to connect from the VM.
+  if command -v "$UNFSD_BIN" >/dev/null 2>&1 && session_run true >/dev/null 2>&1; then
+    ensure_state
+    local probe_port probe_dir probe_exports probe_pid
+    probe_dir="$(mktemp -d)"
+    probe_exports="$STATE_DIR/_check.exports"
+    probe_port="$(alloc_port)"
+    printf '%s %s(ro,insecure)\n' "$probe_dir" "$LOOPBACK" >"$probe_exports"
+    "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$probe_port" -m "$probe_port" -e "$probe_exports" \
+        >"$STATE_DIR/_check.log" 2>&1 &
+    probe_pid=$!
+    local i
+    for (( i=0; i<30; i++ )); do port_is_up "$probe_port" && break; sleep 0.1; done
+    if ! port_is_up "$probe_port"; then
+      _fail "could not start a local NFS server on $LOOPBACK:$probe_port (see $STATE_DIR/_check.log)"
+    elif session_run sh -c "timeout 5 sh -c 'exec 3<>/dev/tcp/$LOOPBACK/$probe_port'" >/dev/null 2>&1; then
+      _pass "runtime VM can reach this distro on $LOOPBACK (mirrored networking)"
+    else
+      _fail "runtime VM cannot reach this distro on $LOOPBACK — enable WSL mirrored networking:
+         add 'networkingMode=mirrored' under [wsl2] in %USERPROFILE%\\.wslconfig, then 'wsl --shutdown'"
+    fi
+    kill "$probe_pid" 2>/dev/null || true
+    rm -rf "$probe_dir"; rm -f "$probe_exports" "$STATE_DIR/_check.log"
+  fi
+
+  echo
+  if [[ $ok -eq 1 ]]; then echo "all dependencies present"; else echo "missing dependencies (see above)"; return 1; fi
+}
+
+usage() {
+  cat >&2 <<EOF
+wslc-remote — a transparent, NFS-accelerated drop-in for 'wslc'
+
+Installed as 'wslc', so use it exactly like the wslc you already know.
+Commands are handled as follows:
+
+  run, create        Drop-in for 'wslc run'/'wslc create': every host bind mount
+                     (-v /host:/ctr, --mount type=bind,...) is transparently
+                     served over NFS instead of the slow default virtiofs share.
+  volume             Drop-in for 'wslc volume': 'remove'/'prune' also tear down
+                     the matching wslc-remote NFS share; all else passes through.
+  <anything else>    Forwarded unchanged to 'wslc' (inspect, images, logs, exec,
+                     ps/list, system, build, pull, help, --help, ...).
+
+wslc-remote-only commands. They all start with '_' so they can never collide
+with a current or future 'wslc' subcommand (bare names like 'status' are NOT
+intercepted — they pass straight through to 'wslc'):
+  _check                     Check that all dependencies are present
+  _help                      Show this help (also shown when run with no arguments)
+
+Dependency: a userspace NFSv3 server 'unfsd' (UNFS3) on PATH. Everything else
+(wslc, mirrored networking, runtime NFS client) is part of a working wslc setup.
+Install unfsd from https://github.com/unfs3/unfs3, or point WSLC_REMOTE_UNFSD at
+an existing binary. Run 'wslc _check' to verify everything is in place.
+
+Env: WSLC_REMOTE_BASE_PORT (default $BASE_PORT), WSLC_REMOTE_STATE (default $STATE_DIR),
+     WSLC_REMOTE_UNFSD (unfsd path), WSLC (path to the real wslc.exe)
+
+Examples:
+  wslc _check                    # verify dependencies are installed
+  wslc run -v \$(pwd):/work -w /work --rm debian:trixie-slim bash
+  wslc run -v \$(pwd):/src:ro -v /home/me/data:/data --rm alpine sh
+  wslc inspect my-container      # forwarded straight to the real wslc
+  wslc images                    # forwarded straight to the real wslc
+EOF
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  run|create)         run_wslc "$cmd" "$@" ;;
+  volume)             handle_volume "$@" ;;
+  _check)             check_deps "$@" ;;
+  _help|"")           usage ;;
+  -h|--help|help)     exec "$WSLC" "$cmd" "$@" ;;
+  _*)                 die "unknown wslc-remote command '$cmd' (see: wslc _help)" ;;
+  *)                  exec "$WSLC" "$cmd" "$@" ;;
+esac
