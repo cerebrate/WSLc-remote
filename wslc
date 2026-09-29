@@ -445,7 +445,7 @@ usage() {
   cat >&2 <<EOF
 wslc-remote — a transparent, NFS-accelerated drop-in for 'wslc'
 
-Installed as 'wslc', so use it exactly like the wslc you already know.
+Installed as 'wslc' and 'container'; both commands behave the same way.
 Commands are handled as follows:
 
   run, create        Drop-in for 'wslc run'/'wslc create': every host bind mount
@@ -472,6 +472,7 @@ Env: WSLC_REMOTE_BASE_PORT (default $BASE_PORT), WSLC_REMOTE_STATE (default $STA
 
 Examples:
   wslc _check                    # verify dependencies are installed
+  container _check               # identical alias installed alongside wslc
   wslc run -v \$(pwd):/work -w /work --rm debian:trixie-slim bash
   wslc run -v \$(pwd):/src:ro -v /home/me/data:/data --rm alpine sh
   wslc inspect my-container      # forwarded straight to the real wslc

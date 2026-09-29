@@ -124,6 +124,15 @@ chmod +x "$staged"
 mv -f "$staged" "$target"
 info "installed $target"
 
+container_alias="$INSTALL_DIR/container"
+if [[ -e "$container_alias" || -L "$container_alias" ]] \
+    && [[ "$(readlink -f "$container_alias")" != "$(readlink -f "$target")" ]]; then
+  warn "not replacing existing command: $container_alias"
+else
+  ln -sfn "$BIN_NAME" "$container_alias"
+  info "installed alias $container_alias -> $BIN_NAME"
+fi
+
 # ---------------------------------------------------------------------------
 # unfsd — package manager only. Never built from source here.
 
@@ -191,7 +200,7 @@ build_unfsd_from_source() {
   $sudo_cmd apt-get install -y build-essential flex bison pkg-config libtirpc-dev rpcsvc-proto \
     || { manual_unfsd_instructions "could not install the UNFS3 build dependencies"; return 1; }
 
-  info "building UNFS3 $UNFS3_VERSION from its official release"
+  info "compiling UNFS3 $UNFS3_VERSION from its official release (build output is shown only on failure)"
   fetch_to "$url" "$archive" \
     || { manual_unfsd_instructions "could not download $url"; return 1; }
   tar -xzf "$archive" -C "$TMP_DIR" \
@@ -205,6 +214,7 @@ build_unfsd_from_source() {
     manual_unfsd_instructions "UNFS3 failed to build"
     return 1
   }
+  info "compiled UNFS3 $UNFS3_VERSION successfully"
 
   install -m 0755 "$source_dir/unfsd" "$INSTALL_DIR/unfsd" \
     || { manual_unfsd_instructions "could not install unfsd into $INSTALL_DIR"; return 1; }
@@ -224,7 +234,7 @@ install_unfsd() {
   # Some Debian/Ubuntu releases package unfs3; others need the source fallback.
   # On Arch it is AUR-only, so plain pacman cannot help. Fedora has no package.
   if command -v apt-get >/dev/null 2>&1; then
-    info "installing unfs3 with apt-get"
+    info "checking for a packaged unfs3 with apt-get"
     $sudo_cmd apt-get update -qq \
       || { manual_unfsd_instructions "'apt-get update' failed"; return 1; }
     if apt-cache show unfs3 >/dev/null 2>&1; then
@@ -289,6 +299,7 @@ fi
 # ---------------------------------------------------------------------------
 # PATH and collisions
 
+PATH_UPDATED=0
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
@@ -298,6 +309,7 @@ case ":$PATH:" in
       grep -Fqx "$path_line" "$profile" || printf '\n%s\n' "$path_line" >>"$profile"
     done
     info "added $INSTALL_DIR to PATH for new shells"
+    PATH_UPDATED=1
     ;;
 esac
 
@@ -310,7 +322,17 @@ fi
 
 echo
 if [[ "$UNFSD_OK" == 1 ]]; then
-  info "done. Verify with:  $BIN_NAME _check"
+  if [[ "$PATH_UPDATED" == 1 ]]; then
+    info "done. Refresh PATH in this shell, then verify:"
+    printf '  export PATH=%q:$PATH\n  %s _check\n' "$INSTALL_DIR" "$BIN_NAME"
+  else
+    info "done. Verify with:  $BIN_NAME _check"
+  fi
 else
-  info "done — install unfsd (see above), then verify with:  $BIN_NAME _check"
+  if [[ "$PATH_UPDATED" == 1 ]]; then
+    info "done — install unfsd (see above), then refresh PATH and verify:"
+    printf '  export PATH=%q:$PATH\n  %s _check\n' "$INSTALL_DIR" "$BIN_NAME"
+  else
+    info "done — install unfsd (see above), then verify with:  $BIN_NAME _check"
+  fi
 fi

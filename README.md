@@ -2,6 +2,12 @@
 
 Use `wslc` inside a WSL distro.
 
+The installer also provides `container` as an equivalent command:
+
+```sh
+container run --rm alpine echo hello
+```
+
 ## Install
 
 ```sh
@@ -102,7 +108,7 @@ The installer also takes `--dir DIR`, `--ref REF` and `--skip-deps`.
 
 ```sh
 wslc volume prune           # tear down any remaining NFS shares first
-rm -f ~/.local/bin/wslc ~/.local/bin/unfsd
+rm -f ~/.local/bin/wslc ~/.local/bin/container ~/.local/bin/unfsd
 rm -rf ~/.local/state/wslc-remote
 ```
 
