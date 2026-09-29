@@ -30,11 +30,12 @@ bash install.sh
   bind mount fails with `Connection refused`.
 - bash 4+
 - **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. This is the
-  only extra dependency. The installer gets it for you where the distro packages it:
+  only extra dependency. The installer gets it from the distro package where available, or
+  builds the official release automatically on Debian/Ubuntu:
 
   | Distro | |
   |---|---|
-  | Debian / Ubuntu | `sudo apt-get install unfs3` |
+  | Debian / Ubuntu | package when available; automatic source-build fallback |
   | openSUSE | `sudo zypper install unfs3` |
   | Arch | AUR only: `yay -S unfs3` |
   | Fedora / others | no package — build from source (below) |

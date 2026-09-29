@@ -4,10 +4,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/craigloewen-msft/WSLc-remote/main/install.sh | bash
 #
-# Installs the `wslc` script into ~/.local/bin and, where the distro packages it,
-# the one external dependency: `unfsd` (UNFS3 userspace NFSv3 server). This script
-# never builds anything from source — if unfsd cannot be installed from a package,
-# it tells you exactly what is missing and how to build it yourself.
+# Installs the `wslc` script into ~/.local/bin and its one external dependency:
+# `unfsd` (UNFS3 userspace NFSv3 server). The installer prefers distro packages
+# and builds the official UNFS3 release when Debian/Ubuntu does not package it.
 #
 # Options (also settable via env):
 #   --dir DIR        install directory        (WSLC_REMOTE_INSTALL_DIR, default ~/.local/bin)
@@ -22,6 +21,7 @@ REF="${WSLC_REMOTE_REF:-main}"
 INSTALL_DIR="${WSLC_REMOTE_INSTALL_DIR:-$HOME/.local/bin}"
 SKIP_DEPS="${WSLC_REMOTE_SKIP_DEPS:-0}"
 BIN_NAME="wslc"
+UNFS3_VERSION="${WSLC_REMOTE_UNFS3_VERSION:-0.11.0}"
 
 # The installer is normally piped into bash, so its own source arrives on stdin.
 # Nothing below may read stdin.
@@ -142,6 +142,7 @@ have_unfsd() {
 link_unfsd_onto_path() {
   [[ -n "${UNFSD_PATH:-}" ]] || return 0
   command -v unfsd >/dev/null 2>&1 && return 0
+  [[ "$(readlink -f "$UNFSD_PATH")" == "$(readlink -f "$INSTALL_DIR/unfsd")" ]] && return 0
   ln -sf "$UNFSD_PATH" "$INSTALL_DIR/unfsd" \
     && info "linked $INSTALL_DIR/unfsd -> $UNFSD_PATH"
 }
@@ -159,11 +160,10 @@ $(printf '\033[33m')wslc-remote is installed, but its one dependency is missing.
 
   Build it from source (takes about a minute):
 
-    # build deps: autoconf automake libtool make gcc flex bison
+    # build deps: autoconf automake libtool make gcc flex bison pkg-config
     #   Fedora/RHEL:  sudo dnf install autoconf automake libtool make gcc flex bison
     #   Arch:         sudo pacman -S --needed base-devel flex bison
-    #   Debian/Ubuntu: sudo apt-get install build-essential autoconf automake libtool flex bison
-    # on modern glibc you may also need libtirpc + rpcsvc-proto headers
+    #   Debian/Ubuntu: sudo apt-get install build-essential autoconf automake libtool flex bison pkg-config libtirpc-dev rpcsvc-proto
 
     git clone https://github.com/unfs3/unfs3
     cd unfs3
@@ -180,6 +180,38 @@ $(printf '\033[33m')wslc-remote is installed, but its one dependency is missing.
 EOF
 }
 
+build_unfsd_from_source() {
+  local sudo_cmd="$1"
+  local archive="$TMP_DIR/unfs3-$UNFS3_VERSION.tar.gz"
+  local source_dir="$TMP_DIR/unfs3-$UNFS3_VERSION"
+  local build_log="$TMP_DIR/unfs3-build.log"
+  local url="https://github.com/unfs3/unfs3/releases/download/unfs3-$UNFS3_VERSION/unfs3-$UNFS3_VERSION.tar.gz"
+
+  info "installing UNFS3 build dependencies with apt-get"
+  $sudo_cmd apt-get install -y build-essential flex bison pkg-config libtirpc-dev rpcsvc-proto \
+    || { manual_unfsd_instructions "could not install the UNFS3 build dependencies"; return 1; }
+
+  info "building UNFS3 $UNFS3_VERSION from its official release"
+  fetch_to "$url" "$archive" \
+    || { manual_unfsd_instructions "could not download $url"; return 1; }
+  tar -xzf "$archive" -C "$TMP_DIR" \
+    || { manual_unfsd_instructions "could not extract $archive"; return 1; }
+  (
+    cd "$source_dir"
+    ./configure
+    make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  ) >"$build_log" 2>&1 || {
+    tail -n 40 "$build_log" >&2
+    manual_unfsd_instructions "UNFS3 failed to build"
+    return 1
+  }
+
+  install -m 0755 "$source_dir/unfsd" "$INSTALL_DIR/unfsd" \
+    || { manual_unfsd_instructions "could not install unfsd into $INSTALL_DIR"; return 1; }
+  UNFSD_PATH="$INSTALL_DIR/unfsd"
+  return 0
+}
+
 install_unfsd() {
   local sudo_cmd=""
   if [[ $EUID -ne 0 ]]; then
@@ -189,13 +221,20 @@ install_unfsd() {
     fi
   fi
 
-  # unfs3 is packaged on Debian/Ubuntu and openSUSE; on Arch it is AUR-only, so
-  # plain pacman cannot help. Fedora has no package at all.
+  # Some Debian/Ubuntu releases package unfs3; others need the source fallback.
+  # On Arch it is AUR-only, so plain pacman cannot help. Fedora has no package.
   if command -v apt-get >/dev/null 2>&1; then
     info "installing unfs3 with apt-get"
-    $sudo_cmd apt-get update -qq || true
-    $sudo_cmd apt-get install -y unfs3 && return 0
-    manual_unfsd_instructions "'apt-get install unfs3' failed"; return 1
+    $sudo_cmd apt-get update -qq \
+      || { manual_unfsd_instructions "'apt-get update' failed"; return 1; }
+    if apt-cache show unfs3 >/dev/null 2>&1; then
+      $sudo_cmd apt-get install -y unfs3 && return 0
+      warn "the unfs3 package failed to install; falling back to an official source build"
+    else
+      warn "the unfs3 package is unavailable; falling back to an official source build"
+    fi
+    build_unfsd_from_source "$sudo_cmd"
+    return
   fi
 
   if command -v zypper >/dev/null 2>&1; then
@@ -253,11 +292,12 @@ fi
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
-    warn "$INSTALL_DIR is not on your PATH. Add it:
-
-    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc
-    export PATH=\"$INSTALL_DIR:\$PATH\"
-"
+    printf -v path_line 'export PATH=%q:$PATH' "$INSTALL_DIR"
+    for profile in "$HOME/.profile" "$HOME/.bashrc"; do
+      touch "$profile"
+      grep -Fqx "$path_line" "$profile" || printf '\n%s\n' "$path_line" >>"$profile"
+    done
+    info "added $INSTALL_DIR to PATH for new shells"
     ;;
 esac
 
