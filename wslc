@@ -27,7 +27,7 @@
 # results/).
 #
 # Data path:  container ── wslc guest volume ── NFS mount on the volume's backing
-#             store (runtime VM, 127.0.0.1) ── mirrored localhost ── unfsd (UNFS3)
+#             store (runtime VM, 127.0.0.1) ── WSL localhost forwarding ── unfsd
 #             userspace NFS server (this distro) ── ext4 files.
 #
 set -euo pipefail
@@ -39,8 +39,8 @@ set -euo pipefail
 #
 # unfsd is launched with -s (single-user: all I/O as the invoking user, so a
 # container's volume-init chown/chmod SETATTR succeeds), -p (never register with
-# rpcbind/portmap — that wedges under mirrored WSL2), -t (TCP only) and the same
-# port for NFS and MOUNT. See start_nfsd() below.
+# rpcbind/portmap — that can wedge across WSL localhost forwarding), -t (TCP
+# only) and the same port for NFS and MOUNT. See start_nfsd() below.
 UNFSD_BIN="${WSLC_REMOTE_UNFSD:-unfsd}"
 STATE_DIR="${WSLC_REMOTE_STATE:-$HOME/.local/state/wslc-remote}"
 SHARES_DIR="$STATE_DIR/shares"
@@ -69,7 +69,7 @@ else
 fi
 
 # NFS options for the runtime VM's `mount(2)`. `mount -i` bypasses /sbin/mount.nfs
-# (which hangs on a portmapper probe over mirrored loopback) and issues the
+# (which can hang on a portmapper probe over forwarded loopback) and issues the
 # syscall directly.
 nfs_opts() { echo "vers=3,addr=$LOOPBACK,port=$1,mountport=$1,mountvers=3,mountproto=tcp,proto=tcp,nolock,soft,timeo=600,retrans=3"; }
 
@@ -116,8 +116,7 @@ ensure_server() {
 # `--mount ...,readonly`) so a `:ro` source can't be written through the
 # unauthenticated NFS export. `rw` binds keep `no_root_squash` (dockerd's
 # volume-init chown/chmod, applied as the invoking user via -s, must succeed).
-# `insecure` permits the runtime VM's unprivileged source port under mirrored
-# networking.
+# `insecure` permits the runtime VM's unprivileged source port.
 start_nfsd() {
   local vol="$1" dir="$2" port="$3" ro="${4:-}"
   local ef="$STATE_DIR/$vol.exports" opts
@@ -389,7 +388,7 @@ reconcile_shares() {
 # ---------------------------------------------------------------------------
 # check_deps : verify the one extra dependency (unfsd) plus the wslc pieces
 # wslc-remote relies on, ending with a real loopback reachability probe between
-# the runtime VM and this distro (mirrored networking). No installs.
+# the runtime VM and this distro. No installs and no networking-mode assumptions.
 check_deps() {
   local ok=1
   _pass(){ printf '  \033[32mOK  \033[0m %s\n' "$1"; }
@@ -410,9 +409,8 @@ check_deps() {
   if session_run sh -c 'modprobe nfs 2>/dev/null; grep -qw nfs /proc/filesystems'; then _pass "runtime VM has an NFS client"; else _fail "runtime VM has no nfs client"; fi
 
   # The whole data path depends on the runtime VM reaching this distro over
-  # 127.0.0.1, which only works with WSL mirrored networking. Without it every
-  # share fails at mount time with a confusing "Connection refused", so test it
-  # for real: serve a scratch directory and try to connect from the VM.
+  # 127.0.0.1. Test that capability directly instead of requiring a specific WSL
+  # networking mode: serve a scratch directory and connect from the runtime VM.
   if command -v "$UNFSD_BIN" >/dev/null 2>&1 && session_run true >/dev/null 2>&1; then
     ensure_state
     local probe_port probe_dir probe_exports probe_pid
@@ -428,10 +426,9 @@ check_deps() {
     if ! port_is_up "$probe_port"; then
       _fail "could not start a local NFS server on $LOOPBACK:$probe_port (see $STATE_DIR/_check.log)"
     elif session_run sh -c "timeout 5 sh -c 'exec 3<>/dev/tcp/$LOOPBACK/$probe_port'" >/dev/null 2>&1; then
-      _pass "runtime VM can reach this distro on $LOOPBACK (mirrored networking)"
+      _pass "runtime VM can reach this distro on $LOOPBACK"
     else
-      _fail "runtime VM cannot reach this distro on $LOOPBACK — enable WSL mirrored networking:
-         add 'networkingMode=mirrored' under [wsl2] in %USERPROFILE%\\.wslconfig, then 'wsl --shutdown'"
+      _fail "runtime VM cannot reach this distro on $LOOPBACK — check WSL localhost forwarding, then run 'wsl --shutdown'"
     fi
     kill "$probe_pid" 2>/dev/null || true
     rm -rf "$probe_dir"; rm -f "$probe_exports" "$STATE_DIR/_check.log"
@@ -463,7 +460,7 @@ intercepted — they pass straight through to 'wslc'):
   _help                      Show this help (also shown when run with no arguments)
 
 Dependency: a userspace NFSv3 server 'unfsd' (UNFS3) on PATH. Everything else
-(wslc, mirrored networking, runtime NFS client) is part of a working wslc setup.
+(wslc, WSL localhost forwarding, runtime NFS client) is part of a working setup.
 Install unfsd from https://github.com/unfs3/unfs3, or point WSLC_REMOTE_UNFSD at
 an existing binary. Run 'wslc _check' to verify everything is in place.
 

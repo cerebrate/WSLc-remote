@@ -25,15 +25,10 @@ bash install.sh
 ## Requirements
 
 - WSL with container support (provides `wslc.exe`)
-- **WSL mirrored networking** — required. Add this to `%USERPROFILE%\.wslconfig` on Windows:
-
-  ```ini
-  [wsl2]
-  networkingMode=mirrored
-  ```
-
-  then run `wsl --shutdown`. Without it the runtime VM can't reach your distro and every
-  bind mount fails with `Connection refused`.
+- **WSL localhost forwarding** between the container runtime VM and your distro. Both
+  `networkingMode=mirrored` and `networkingMode=virtioproxy` (`Consomme`) are supported.
+  Run `wslc _check` to test the actual connection instead of relying on the configured
+  mode name. After changing `%USERPROFILE%\.wslconfig`, run `wsl --shutdown`.
 - bash 4+
 - **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. This is the
   only extra dependency. The installer gets it from the distro package where available, or
@@ -90,8 +85,9 @@ For each host bind mount, wslc-remote:
    inside the runtime VM,
 3. rewrites your `-v /host/dir:/ctr` into `-v <volume>:/ctr` and execs the real `wslc`.
 
-The container sees an ordinary bind mount. Traffic goes over NFS on `127.0.0.1` (via WSL mirrored
-networking) instead of virtiofs. Shares are reused across runs and torn down with their volume.
+The container sees an ordinary bind mount. Traffic goes over NFS on `127.0.0.1` through WSL
+localhost forwarding instead of virtiofs. Shares are reused across runs and torn down with their
+volume.
 
 ## Configuration
 

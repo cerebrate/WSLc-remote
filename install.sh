@@ -134,7 +134,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# unfsd — package manager only. Never built from source here.
+# unfsd — use a distro package when available, otherwise build the official release.
 
 have_unfsd() {
   if command -v unfsd >/dev/null 2>&1; then UNFSD_PATH="$(command -v unfsd)"; return 0; fi
@@ -205,6 +205,33 @@ build_unfsd_from_source() {
     || { manual_unfsd_instructions "could not download $url"; return 1; }
   tar -xzf "$archive" -C "$TMP_DIR" \
     || { manual_unfsd_instructions "could not extract $archive"; return 1; }
+  # WSL's virtioproxy/Consomme socket shim returns a positive HRESULT-like value
+  # when UNFS3 binds an IPv4-mapped address through an IPv6 socket. Force a real
+  # IPv4 socket for IPv4 bind addresses; native IPv6 behavior remains unchanged.
+  if ! sed -i \
+    -e '/^[[:space:]]*sock = socket(PF_INET6, SOCK_DGRAM, 0);$/,+3c\
+    if (IN6_IS_ADDR_V4MAPPED(\&opt_bind_addr) ||\
+        IN6_IS_ADDR_V4COMPAT(\&opt_bind_addr)) {\
+        sock = socket(PF_INET, SOCK_DGRAM, 0);\
+    } else {\
+        sock = socket(PF_INET6, SOCK_DGRAM, 0);\
+        if ((sock == -1) \&\& (errno == EAFNOSUPPORT))\
+            sock = socket(PF_INET, SOCK_DGRAM, 0);\
+    }' \
+    -e '/^[[:space:]]*sock = socket(PF_INET6, SOCK_STREAM, 0);$/,+3c\
+    if (IN6_IS_ADDR_V4MAPPED(\&opt_bind_addr) ||\
+        IN6_IS_ADDR_V4COMPAT(\&opt_bind_addr)) {\
+        sock = socket(PF_INET, SOCK_STREAM, 0);\
+    } else {\
+        sock = socket(PF_INET6, SOCK_STREAM, 0);\
+        if ((sock == -1) \&\& (errno == EAFNOSUPPORT))\
+            sock = socket(PF_INET, SOCK_STREAM, 0);\
+    }' \
+    "$source_dir/daemon.c"
+  then
+    manual_unfsd_instructions "could not apply the WSL IPv4 socket compatibility patch"
+    return 1
+  fi
   (
     cd "$source_dir"
     ./configure
