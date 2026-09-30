@@ -22,6 +22,22 @@ less install.sh
 bash install.sh
 ```
 
+### Debian / Ubuntu package
+
+On Debian and Ubuntu you can install a `.deb` instead. It puts `wslc`, the `container` alias and
+`wslc-build-unfsd` in `/usr/bin` and is managed by `apt`/`dpkg`. Packages are not published to an
+apt repository yet, so build one from a checkout (details in
+[`packaging/deb/README.md`](packaging/deb/README.md)):
+
+```sh
+packaging/deb/build.sh
+sudo apt install ./packaging/deb/dist/wslc-remote_*.deb
+```
+
+`unfsd` is pulled in automatically where your distro packages `unfs3`. Where it does not
+(e.g. Ubuntu 24.04), run `sudo wslc-build-unfsd` to build the official release.
+Remove with `sudo apt remove wslc-remote`.
+
 ## Requirements
 
 - WSL with container support (provides `wslc.exe`)
@@ -101,6 +117,8 @@ volume.
 The installer also takes `--dir DIR`, `--ref REF` and `--skip-deps`.
 
 ## Uninstall
+
+Installed the `.deb`? `sudo apt remove wslc-remote`. Installed with the script:
 
 ```sh
 wslc volume prune           # tear down any remaining NFS shares first
