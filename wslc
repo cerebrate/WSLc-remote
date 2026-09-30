@@ -194,7 +194,7 @@ probe_addr() {
     session_run sh -c "timeout 4 sh -c 'exec 3<>/dev/tcp/$addr/$port; sleep 3'" >/dev/null 2>&1 &
     vpid=$!
     for (( i=0; i<40; i++ )); do
-      peer="$(ss -Htn state established "( sport = :$port )" 2>/dev/null | awk 'NR==1{print $4}')"
+      peer="$(ss -Htn state established "( src $addr:$port )" 2>/dev/null | awk 'NR==1{print $4}')"
       [[ -n "$peer" ]] && break
       sleep 0.1
     done
@@ -212,18 +212,19 @@ probe_addr() {
 detect_net() {
   local a
   ensure_state
+  NET_TRIED=""
   if [[ "$ADDR_MODE" != auto ]]; then
     BIND_ADDR="$ADDR_MODE"; NET_HOW="WSLC_REMOTE_ADDR"
     if [[ -n "${WSLC_REMOTE_CLIENT:-}" ]]; then CLIENT_ADDR="$WSLC_REMOTE_CLIENT"; return 0; fi
-    probe_addr "$BIND_ADDR" || return 1
+    if probe_addr "$BIND_ADDR"; then NET_TRIED+="$BIND_ADDR: reachable"$'\n'; else NET_TRIED+="$BIND_ADDR: unreachable"$'\n'; return 1; fi
     CLIENT_ADDR="$PROBE_CLIENT"; return 0
   fi
   for a in "$LOOPBACK" $(candidate_addrs); do
-    if probe_addr "$a"; then
-      BIND_ADDR="$a"; CLIENT_ADDR="$PROBE_CLIENT"
-      if [[ "$a" == "$LOOPBACK" ]]; then NET_HOW="loopback"; else NET_HOW="detected"; fi
-      return 0
-    fi
+    if ! probe_addr "$a"; then NET_TRIED+="$a: unreachable from the runtime VM"$'\n'; continue; fi
+    NET_TRIED+="$a: reachable"$'\n'
+    BIND_ADDR="$a"; CLIENT_ADDR="$PROBE_CLIENT"
+    if [[ "$a" == "$LOOPBACK" ]]; then NET_HOW="loopback"; else NET_HOW="detected"; fi
+    return 0
   done
   return 1
 }
@@ -240,7 +241,7 @@ resolve_net() {
     c_bind="${CACHED_BIND:-}"; c_client="${CACHED_CLIENT:-}"
     if [[ -n "$c_bind" && -n "$c_client" ]] \
        && { [[ "$c_bind" == "$LOOPBACK" ]] || ip -4 -o addr show 2>/dev/null | grep -qE "inet $c_bind/"; }; then
-      BIND_ADDR="$c_bind"; CLIENT_ADDR="$c_client"; NET_RESOLVED=1; return 0
+      BIND_ADDR="$c_bind"; CLIENT_ADDR="$c_client"; NET_HOW="cached"; NET_RESOLVED=1; return 0
     fi
   fi
   detect_net || die "the runtime VM cannot reach this distro's NFS server.
@@ -250,9 +251,11 @@ resolve_net() {
   if [[ "$BIND_ADDR" != "$LOOPBACK" ]]; then
     warn "NFS server is listening on $BIND_ADDR (not loopback), restricted to client $CLIENT_ADDR"
   fi
-  printf 'CACHED_BIND=%s\nCACHED_CLIENT=%s\n' "$BIND_ADDR" "$CLIENT_ADDR" >"$NET_FILE"
+  save_net
   NET_RESOLVED=1
 }
+
+save_net() { printf 'CACHED_BIND=%s\nCACHED_CLIENT=%s\n' "$BIND_ADDR" "$CLIENT_ADDR" >"$NET_FILE"; }
 
 # ---------------------------------------------------------------------------
 # abort_share <vol> <pid> : roll back a partially-created share so that a failure
@@ -529,12 +532,17 @@ check_deps() {
   # instead of requiring a specific WSL networking mode.
   if command -v "$UNFSD_BIN" >/dev/null 2>&1 && session_run true >/dev/null 2>&1; then
     if detect_net; then
+      # Refresh the cache so that 'wslc run' uses exactly the address reported here.
+      [[ "$ADDR_MODE" == auto ]] && save_net
       if [[ "$BIND_ADDR" == "$LOOPBACK" ]]; then
         _pass "runtime VM can reach this distro on $LOOPBACK"
       else
         _pass "runtime VM can reach this distro on $BIND_ADDR (client $CLIENT_ADDR; $NET_HOW) — not loopback: the NFS server will listen on that address"
       fi
+      printf '%s' "$NET_TRIED" | sed 's/^/         probed /'
     else
+      printf '%s' "$NET_TRIED" | sed 's/^/         probed /'
+
       _fail "runtime VM cannot reach this distro on $LOOPBACK or its own addresses ($(candidate_addrs | tr '\n' ' ')) — check WSL networking, or set WSLC_REMOTE_ADDR"
     fi
   fi

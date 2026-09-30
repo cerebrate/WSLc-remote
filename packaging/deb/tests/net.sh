@@ -82,4 +82,12 @@ chmod +x "$tmp/wslc-deaf.exe"
 if out="$(WSLC="$tmp/wslc-deaf.exe" WSLC_REMOTE_UNFSD="$tmp/unfsd" WSLC_REMOTE_STATE="$tmp/state" WSLC_REMOTE_BASE_PORT=23049 \
      bash -c 'source "$1"; resolve_net' _ "$wslc" 2>&1)"; then fail "expected failure"; fi
 [[ "$out" == *"cannot reach this distro"* ]] && pass "clear error when no address works" || fail "error text: $out"
+# _check reports the address actually chosen, with what was probed, and refreshes the cache
+rm -rf "$tmp/state"
+out="$(FAKE_BLOCK_LOOPBACK=1 WSLC="$tmp/wslc.exe" WSLC_REMOTE_UNFSD="$tmp/unfsd" WSLC_REMOTE_STATE="$tmp/state" WSLC_REMOTE_BASE_PORT=23049 "$wslc" _check 2>&1 || true)"
+[[ "$out" == *"can reach this distro on $addr (client $addr"* && "$out" == *"probed 127.0.0.1: unreachable"* ]] \
+  && pass "_check reports the real address and probe results" || fail "_check output: $out"
+printf 'CACHED_BIND=%s\nCACHED_CLIENT=%s\n' "$addr" "$addr" >"$tmp/state/net.env"
+out="$(FAKE_BLOCK_LOOPBACK='' WSLC="$tmp/wslc.exe" WSLC_REMOTE_UNFSD="$tmp/unfsd" WSLC_REMOTE_STATE="$tmp/state" WSLC_REMOTE_BASE_PORT=23049 "$wslc" _check 2>&1 || true)"
+grep -q 'CACHED_BIND=127.0.0.1' "$tmp/state/net.env" && pass "_check refreshes the cache" || fail "cache not refreshed: $out"
 echo "net tests passed"
