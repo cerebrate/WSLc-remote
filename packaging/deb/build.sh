@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build wslc-remote_<version>_all.deb into packaging/deb/dist/ (needs dpkg-deb).
-# Usage: packaging/deb/build.sh [version]     (default: 0.1.0+git<date>.<sha>)
+# Usage: packaging/deb/build.sh [version]     (default: <VERSION>+git<date>.<sha>)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
-version="${1:-0.1.0+git$(date -u +%Y%m%d).$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo local)}"
+version="${1:-$(cat "$here/VERSION")+git$(date -u +%Y%m%d).$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo local)}"
 
 stage="$(mktemp -d)"; trap 'rm -rf "$stage"' EXIT
 install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/doc/wslc-remote"

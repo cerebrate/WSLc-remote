@@ -22,11 +22,32 @@ less install.sh
 bash install.sh
 ```
 
-### Debian / Ubuntu package
+### Debian / Ubuntu package (apt)
 
-On Debian and Ubuntu you can install a `.deb` instead. It puts `wslc`, the `container` alias and
-`wslc-build-unfsd` in `/usr/bin` and is managed by `apt`/`dpkg`. Packages are not published to an
-apt repository yet, so build one from a checkout (details in
+On Debian and Ubuntu you can install a `.deb` instead of using the script. It puts `wslc`, the
+`container` alias and `wslc-build-unfsd` in `/usr/bin` and is managed by `apt`/`dpkg`.
+
+**From the wsl-transdebian repository.** The latest release package should be available from
+the [wsl-transdebian](https://arkane-systems.github.io/wsl-transdebian/) apt repository. Add the
+repository (see [its instructions](https://arkane-systems.github.io/wsl-transdebian/); in short):
+
+```sh
+sudo apt install lsb-release
+sudo wget -O /etc/apt/trusted.gpg.d/wsl-transdebian.gpg https://arkane-systems.github.io/wsl-transdebian/apt/wsl-transdebian.gpg
+sudo chmod a+r /etc/apt/trusted.gpg.d/wsl-transdebian.gpg
+sudo tee /etc/apt/sources.list.d/wsl-transdebian.list > /dev/null << EOF
+deb https://arkane-systems.github.io/wsl-transdebian/apt/ $(lsb_release -cs) main
+deb-src https://arkane-systems.github.io/wsl-transdebian/apt/ $(lsb_release -cs) main
+EOF
+sudo apt update
+sudo apt install wslc-remote
+```
+
+**From a release.** Every merge to `main` publishes the built `.deb` on this repository's
+[Releases page](../../releases); download it and run `sudo apt install ./wslc-remote_*.deb`.
+
+**Build it yourself.** If you would rather not trust a third-party repository (or a prebuilt
+binary), build the package from a checkout (details in
 [`packaging/deb/README.md`](packaging/deb/README.md)):
 
 ```sh

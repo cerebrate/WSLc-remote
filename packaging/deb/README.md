@@ -23,3 +23,9 @@ docker run --rm -v "$PWD":/src -w /src ubuntu:24.04 \
 
 As root it also installs the package, runs `wslc`/`container` against a fake
 `wslc.exe`, checks `unfsd` discovery off `PATH`, and removes/purges it.
+
+## Releases
+
+`.github/workflows/deb.yml` runs the tests on every pull request. On a push to `main` (a merged
+PR) it also builds `wslc-remote_<VERSION>+git<date>.<sha>_all.deb` and publishes it as a GitHub
+release. Bump the base version in `packaging/deb/VERSION` for a new release series.
