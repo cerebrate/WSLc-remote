@@ -41,10 +41,17 @@ Remove with `sudo apt remove wslc-remote`.
 ## Requirements
 
 - WSL with container support (provides `wslc.exe`)
-- **WSL localhost forwarding** between the container runtime VM and your distro. Both
-  `networkingMode=mirrored` and `networkingMode=virtioproxy` (`Consomme`) are supported.
-  Run `wslc _check` to test the actual connection instead of relying on the configured
-  mode name. After changing `%USERPROFILE%\.wslconfig`, run `wsl --shutdown`.
+- **A network path from the container runtime VM to your distro.** By default wslc-remote
+  probes for one, so you don't need to pick a networking mode:
+  1. `127.0.0.1` via WSL localhost forwarding, as in `networkingMode=mirrored` and
+     `networkingMode=virtioproxy` (`Consomme`); if that fails,
+  2. one of your distro's own IPv4 addresses (e.g. with bridged networking). The NFS server
+     then listens on that address only and admits only the runtime VM's address. It is
+     unauthenticated, so use this on networks you trust.
+
+  The result is cached and re-checked when your address changes. Run `wslc _check` to see what
+  was found; force a choice with `WSLC_REMOTE_ADDR`. After changing
+  `%USERPROFILE%\.wslconfig`, run `wsl --shutdown`.
 - bash 4+
 - **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. This is the
   only extra dependency. The installer gets it from the distro package where available, or
@@ -96,13 +103,14 @@ with a current or future `wslc` subcommand: `wslc _check` and `wslc _help`.
 
 For each host bind mount, wslc-remote:
 
-1. starts a `unfsd` NFSv3 server in your distro, exporting that directory on loopback only,
+1. starts a `unfsd` NFSv3 server in your distro, exporting that directory to the runtime VM only
+   (on loopback, or the address found by the network probe),
 2. creates a `wslc` guest volume and NFS-mounts that server onto the volume's backing store
    inside the runtime VM,
 3. rewrites your `-v /host/dir:/ctr` into `-v <volume>:/ctr` and execs the real `wslc`.
 
 The container sees an ordinary bind mount. Traffic goes over NFS on `127.0.0.1` through WSL
-localhost forwarding instead of virtiofs. Shares are reused across runs and torn down with their
+localhost forwarding (or your distro's address, if loopback is unreachable) instead of virtiofs. Shares are reused across runs and torn down with their
 volume.
 
 ## Configuration
@@ -111,6 +119,8 @@ volume.
 |---|---|---|
 | `WSLC` | `wslc.exe` on PATH, else `/mnt/c/Program Files/WSL/wslc.exe` | path to the real wslc CLI |
 | `WSLC_REMOTE_UNFSD` | `unfsd` | path to the unfsd binary |
+| `WSLC_REMOTE_ADDR` | `auto` | address the runtime VM uses to reach the NFS server: `auto` (loopback, else a reachable address of this distro) or an IP |
+| `WSLC_REMOTE_CLIENT` | detected | client address the NFS export admits (only with a non-loopback `WSLC_REMOTE_ADDR`) |
 | `WSLC_REMOTE_BASE_PORT` | `12049` | first port in the range used for NFS servers |
 | `WSLC_REMOTE_STATE` | `~/.local/state/wslc-remote` | share state, logs, exports |
 

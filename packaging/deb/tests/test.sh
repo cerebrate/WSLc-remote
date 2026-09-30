@@ -19,6 +19,7 @@ for f in "$here"/../files/wslc-build-unfsd "$here"/../../../wslc "$here"/../buil
   bash -n "$f" 2>/dev/null || sh -n "$f" || fail "syntax $f"
 done; pass "shell syntax"
 command -v shellcheck >/dev/null && { shellcheck -S warning "$here"/../files/wslc-build-unfsd "$here"/../build.sh && pass shellcheck; } || true
+"$here/net.sh" && pass "network detection tests" || fail "network detection tests"
 command -v lintian >/dev/null && { lintian --no-tag-display-limit "$deb" || true; }
 
 [[ $EUID -eq 0 ]] || { echo "not root: skipping install tests"; exit 0; }

@@ -21,7 +21,7 @@ jobs:
       - name: Install tooling
         run: |
           apt-get update -qq
-          apt-get install -y -qq git ca-certificates lintian shellcheck
+          apt-get install -y -qq git ca-certificates lintian shellcheck python3 iproute2
       - uses: actions/checkout@v4
       - name: Build, install and test the package
         run: |
