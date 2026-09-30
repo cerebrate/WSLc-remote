@@ -42,6 +42,13 @@ set -euo pipefail
 # rpcbind/portmap — that can wedge across WSL localhost forwarding), -t (TCP
 # only) and the same port for NFS and MOUNT. See start_nfsd() below.
 UNFSD_BIN="${WSLC_REMOTE_UNFSD:-unfsd}"
+# Distro packages put unfsd in /usr/sbin, which is not on every user's PATH.
+if [[ -z "${WSLC_REMOTE_UNFSD:-}" ]] && ! command -v unfsd >/dev/null 2>&1; then
+  for _d in /usr/local/sbin /usr/sbin /sbin; do
+    [[ -x "$_d/unfsd" ]] && { UNFSD_BIN="$_d/unfsd"; break; }
+  done
+  unset _d
+fi
 STATE_DIR="${WSLC_REMOTE_STATE:-$HOME/.local/state/wslc-remote}"
 SHARES_DIR="$STATE_DIR/shares"
 BASE_PORT="${WSLC_REMOTE_BASE_PORT:-12049}"
