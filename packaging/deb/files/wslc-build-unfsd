@@ -12,10 +12,19 @@ PREFIX="${PREFIX:-/usr/local}"
 die() { echo "wslc-build-unfsd: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "run as root (sudo wslc-build-unfsd)"
 
-if apt-cache show unfs3 >/dev/null 2>&1; then
+# `apt-cache show` also succeeds for a package that is merely named in another
+# package's Recommends (such as wslc-remote's own), so ask for a real candidate.
+unfs3_candidate() {
+  local c; c="$(apt-cache policy unfs3 2>/dev/null | awk '/Candidate:/{print $2}')"
+  [[ -n "$c" && "$c" != "(none)" ]]
+}
+
+if unfs3_candidate; then
+  [[ -n "${WSLC_BUILD_UNFSD_DRY_RUN:-}" ]] && { echo "apt"; exit 0; }
   echo "unfs3 is packaged here; installing it with apt-get instead"
   exec apt-get install -y unfs3
 fi
+[[ -n "${WSLC_BUILD_UNFSD_DRY_RUN:-}" ]] && { echo "source"; exit 0; }
 
 apt-get install -y build-essential flex bison pkg-config libtirpc-dev rpcsvc-proto curl ca-certificates
 

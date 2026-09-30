@@ -46,6 +46,10 @@ grep -q 'userspace NFS server' <<<"$out" && pass "_check finds unfsd off PATH" |
 [[ $created == 1 ]] && rm -f "$stub"
 
 check "build helper present" test -x /usr/bin/wslc-build-unfsd
+# Regression: the installed package itself Recommends unfs3, which must not make
+# the helper believe unfs3 is installable. Expect "apt" only if a candidate exists.
+want=source; [[ -n "$(apt-cache policy unfs3 | awk '/Candidate:/ && $2!="(none)"{print $2}')" ]] && want=apt
+[[ "$(WSLC_BUILD_UNFSD_DRY_RUN=1 wslc-build-unfsd)" == "$want" ]] && pass "build helper picks $want path" || fail "build helper path (wanted $want)"
 
 # Remove / purge cleanly
 apt-get remove -y wslc-remote >/dev/null
